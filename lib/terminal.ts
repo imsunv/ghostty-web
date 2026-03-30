@@ -473,11 +473,11 @@ export class Terminal implements ITerminalCore {
             const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
             if (!isAltScreen) {
               if (event.code === 'PageUp') {
-                this.scrollPages(1);
+                this.scrollPages(-1);
                 return true;
               }
               if (event.code === 'PageDown') {
-                this.scrollPages(-1);
+                this.scrollPages(1);
                 return true;
               }
             }
