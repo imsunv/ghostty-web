@@ -133,6 +133,14 @@ export class Terminal implements ITerminalCore {
   private readonly SCROLLBAR_HIDE_DELAY_MS = 1500; // Hide after 1.5 seconds
   private readonly SCROLLBAR_FADE_DURATION_MS = 200; // 200ms fade animation
 
+  // Touch scrolling state
+  private activeTouchId: number | null = null;
+  private lastTouchY: number = 0;
+  private touchAccumulatedDeltaY: number = 0;
+  private touchMoved: boolean = false;
+  private readonly TOUCH_SCROLL_THRESHOLD_PX = 8;
+  private readonly TOUCH_SCROLL_STEP_PX = 33;
+
   constructor(options: ITerminalOptions = {}) {
     // Use provided Ghostty instance (for test isolation) or get module-level instance
     this.ghostty = options.ghostty ?? getGhostty();
@@ -410,12 +418,6 @@ export class Terminal implements ITerminalCore {
         ev.preventDefault();
         textarea.focus();
       });
-      // Mobile: touchend with preventDefault to suppress iOS caret
-      this.canvas.addEventListener('touchend', (ev) => {
-        ev.preventDefault();
-        textarea.focus();
-      });
-
       // Create renderer
       this.renderer = new CanvasRenderer(this.canvas, {
         fontSize: this.options.fontSize,
@@ -534,6 +536,10 @@ export class Terminal implements ITerminalCore {
       // Setup wheel event handling for scrolling (Phase 2)
       // Use capture phase to ensure we get the event before browser scrolling
       parent.addEventListener('wheel', this.handleWheel, { passive: false, capture: true });
+      parent.addEventListener('touchstart', this.handleTouchStart, { passive: false });
+      parent.addEventListener('touchmove', this.handleTouchMove, { passive: false });
+      parent.addEventListener('touchend', this.handleTouchEnd, { passive: false });
+      parent.addEventListener('touchcancel', this.handleTouchCancel, { passive: false });
 
       // Render initial blank screen (force full redraw)
       this.renderer.render(this.wasmTerm, true, this.viewportY, this, this.scrollbarOpacity);
@@ -1251,7 +1257,11 @@ export class Terminal implements ITerminalCore {
 
     // Remove event listeners
     if (this.element) {
-      this.element.removeEventListener('wheel', this.handleWheel);
+      this.element.removeEventListener('wheel', this.handleWheel, { capture: true });
+      this.element.removeEventListener('touchstart', this.handleTouchStart);
+      this.element.removeEventListener('touchmove', this.handleTouchMove);
+      this.element.removeEventListener('touchend', this.handleTouchEnd);
+      this.element.removeEventListener('touchcancel', this.handleTouchCancel);
       this.element.removeEventListener('mousedown', this.handleMouseDown, { capture: true });
       this.element.removeEventListener('mousemove', this.handleMouseMove);
       this.element.removeEventListener('mouseleave', this.handleMouseLeave);
@@ -1568,11 +1578,7 @@ export class Terminal implements ITerminalCore {
       return;
     }
 
-    // Check if in alternate screen mode (vim, less, htop, tmux, etc.)
-    const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
-    const hasMouseTracking = this.wasmTerm?.hasMouseTracking() ?? false;
-
-    if (isAltScreen && hasMouseTracking) {
+    if (!this.handleScrollInput(e.deltaY, e.deltaMode, 'wheel', e.clientX, e.clientY)) {
       // Application has mouse tracking enabled (e.g. tmux with mouse mode on).
       // Let input-handler forward the wheel event as mouse button 64/65 sequences
       // so the application (tmux) can handle scroll internally.
@@ -1581,52 +1587,195 @@ export class Terminal implements ITerminalCore {
     }
 
     e.stopPropagation();
+  };
+
+  private handleTouchStart = (e: TouchEvent): void => {
+    if (e.touches.length !== 1) {
+      this.resetTouchScrollState();
+      return;
+    }
+
+    const touch = e.touches[0];
+    this.activeTouchId = touch.identifier;
+    this.lastTouchY = touch.clientY;
+    this.touchAccumulatedDeltaY = 0;
+    this.touchMoved = false;
+  };
+
+  private handleTouchMove = (e: TouchEvent): void => {
+    if (e.touches.length !== 1) {
+      this.resetTouchScrollState();
+      return;
+    }
+
+    const touch = this.getTrackedTouch(e.touches);
+    if (!touch) return;
+
+    const deltaY = touch.clientY - this.lastTouchY;
+    this.lastTouchY = touch.clientY;
+
+    if (deltaY === 0) return;
+
+    this.touchAccumulatedDeltaY += deltaY;
+    if (!this.touchMoved) {
+      if (Math.abs(this.touchAccumulatedDeltaY) < this.TOUCH_SCROLL_THRESHOLD_PX) {
+        return;
+      }
+      this.touchMoved = true;
+    }
+
+    e.preventDefault();
+    this.handleTouchScroll(touch.clientX, touch.clientY);
+  };
+
+  private handleTouchEnd = (e: TouchEvent): void => {
+    if (this.activeTouchId === null || !this.hasTrackedTouch(e.changedTouches)) {
+      return;
+    }
+
+    const shouldFocus = !this.touchMoved && e.target === this.canvas;
+    if (shouldFocus && this.textarea) {
+      e.preventDefault();
+      this.textarea.focus();
+    }
+
+    this.resetTouchScrollState();
+  };
+
+  private handleTouchCancel = (): void => {
+    this.resetTouchScrollState();
+  };
+
+  private resetTouchScrollState(): void {
+    this.activeTouchId = null;
+    this.touchAccumulatedDeltaY = 0;
+    this.touchMoved = false;
+  }
+
+  private getTrackedTouch(touches: TouchList): Touch | null {
+    if (this.activeTouchId === null) return null;
+
+    for (let i = 0; i < touches.length; i++) {
+      if (touches[i].identifier === this.activeTouchId) {
+        return touches[i];
+      }
+    }
+
+    return null;
+  }
+
+  private hasTrackedTouch(touches: TouchList): boolean {
+    return this.getTrackedTouch(touches) !== null;
+  }
+
+  private handleTouchScroll(clientX: number, clientY: number): void {
+    const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
+    const hasMouseTracking = this.wasmTerm?.hasMouseTracking() ?? false;
+
+    if (!isAltScreen) {
+      const deltaY = -this.touchAccumulatedDeltaY;
+      this.touchAccumulatedDeltaY = 0;
+      this.handleScrollInput(deltaY, WheelEvent.DOM_DELTA_PIXEL, 'touch', clientX, clientY);
+      return;
+    }
+
+    const stepCount = Math.floor(Math.abs(this.touchAccumulatedDeltaY) / this.TOUCH_SCROLL_STEP_PX);
+    if (stepCount === 0) {
+      return;
+    }
+
+    const fingerMovedDown = this.touchAccumulatedDeltaY > 0;
+    const remainder = Math.abs(this.touchAccumulatedDeltaY) % this.TOUCH_SCROLL_STEP_PX;
+    this.touchAccumulatedDeltaY = fingerMovedDown ? remainder : -remainder;
+
+    if (hasMouseTracking) {
+      for (let i = 0; i < stepCount; i++) {
+        this.inputHandler?.sendWheelAtPosition(fingerMovedDown ? -1 : 1, clientX, clientY);
+      }
+      return;
+    }
+
+    for (let i = 0; i < stepCount; i++) {
+      this.dataEmitter.fire(fingerMovedDown ? '\x1B[A' : '\x1B[B');
+    }
+  }
+
+  private handleScrollInput(
+    deltaY: number,
+    deltaMode: number,
+    source: 'wheel' | 'touch',
+    clientX?: number,
+    clientY?: number
+  ): boolean {
+    // Check if in alternate screen mode (vim, less, htop, tmux, etc.)
+    const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
+    const hasMouseTracking = this.wasmTerm?.hasMouseTracking() ?? false;
+
+    if (isAltScreen && hasMouseTracking) {
+      if (source === 'touch' && clientX !== undefined && clientY !== undefined) {
+        this.inputHandler?.sendWheelAtPosition(deltaY, clientX, clientY);
+        return true;
+      }
+      return false;
+    }
 
     if (isAltScreen) {
-      // Alternate screen without mouse tracking: send arrow keys to the application
-      // Applications like vim/htop handle scrolling internally via arrow keys
-      // Standard: ~3 arrow presses per wheel "click"
-      const direction = e.deltaY > 0 ? 'down' : 'up';
-      const count = Math.min(Math.abs(Math.round(e.deltaY / 33)), 5); // Cap at 5
+      // Alternate screen without mouse tracking: send arrow keys to the application.
+      const direction = deltaY > 0 ? 'down' : 'up';
+      const count = this.getAlternateScreenScrollCount(deltaY, deltaMode);
 
       for (let i = 0; i < count; i++) {
         if (direction === 'up') {
-          this.dataEmitter.fire('\x1B[A'); // Up arrow
+          this.dataEmitter.fire('\x1B[A');
         } else {
-          this.dataEmitter.fire('\x1B[B'); // Down arrow
+          this.dataEmitter.fire('\x1B[B');
         }
       }
-    } else {
-      // Normal screen: scroll viewport through history with smooth scrolling
-      // Handle different deltaMode values for better trackpad/mouse support
-      let deltaLines: number;
 
-      if (e.deltaMode === WheelEvent.DOM_DELTA_PIXEL) {
-        // Pixel mode (trackpads): convert pixels to lines
-        // Use actual line height from renderer for accurate conversion
-        const lineHeight = this.renderer?.getMetrics()?.height ?? 20;
-        deltaLines = e.deltaY / lineHeight;
-      } else if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
-        // Line mode (some mice): use directly
-        deltaLines = e.deltaY;
-      } else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
-        // Page mode (rare): convert pages to lines
-        deltaLines = e.deltaY * this.rows;
-      } else {
-        // Fallback: assume pixel mode with legacy divisor
-        deltaLines = e.deltaY / 33;
-      }
-
-      // Use smooth scrolling for any amount (no rounding needed)
-      if (deltaLines !== 0) {
-        // Calculate target position
-        // deltaY > 0 = scroll down (decrease viewportY)
-        // deltaY < 0 = scroll up (increase viewportY)
-        const targetY = this.viewportY - deltaLines;
-        this.smoothScrollTo(targetY);
-      }
+      return true;
     }
-  };
+
+    const deltaLines = this.convertScrollDeltaToLines(deltaY, deltaMode);
+    if (deltaLines !== 0) {
+      const targetY = this.viewportY - deltaLines;
+      this.smoothScrollTo(targetY);
+    }
+
+    return true;
+  }
+
+  private getAlternateScreenScrollCount(deltaY: number, deltaMode: number): number {
+    let deltaPixels = deltaY;
+
+    if (deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      const lineHeight = this.renderer?.getMetrics()?.height ?? 20;
+      deltaPixels = deltaY * lineHeight;
+    } else if (deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      const lineHeight = this.renderer?.getMetrics()?.height ?? 20;
+      deltaPixels = deltaY * this.rows * lineHeight;
+    }
+
+    return Math.min(Math.abs(Math.round(deltaPixels / 33)), 5);
+  }
+
+  private convertScrollDeltaToLines(deltaY: number, deltaMode: number): number {
+    if (deltaMode === WheelEvent.DOM_DELTA_PIXEL) {
+      // Pixel mode (trackpads/touch): convert pixels to lines using actual line height.
+      const lineHeight = this.renderer?.getMetrics()?.height ?? 20;
+      return deltaY / lineHeight;
+    }
+
+    if (deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      return deltaY;
+    }
+
+    if (deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      return deltaY * this.rows;
+    }
+
+    // Fallback: assume pixel mode with legacy divisor.
+    return deltaY / 33;
+  }
 
   /**
    * Handle mouse down for scrollbar interaction

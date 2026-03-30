@@ -9,6 +9,40 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { Terminal } from './terminal';
 import { createIsolatedTerminal } from './test-helpers';
 
+type TouchPoint = {
+  identifier?: number;
+  clientX: number;
+  clientY: number;
+};
+
+function dispatchTouchEvent(
+  target: EventTarget,
+  type: string,
+  touches: TouchPoint[],
+  changedTouches: TouchPoint[] = touches
+): Event {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  const activeTouches = touches.map((touch, index) => ({
+    identifier: touch.identifier ?? index,
+    clientX: touch.clientX,
+    clientY: touch.clientY,
+  }));
+  const changed = changedTouches.map((touch, index) => ({
+    identifier: touch.identifier ?? index,
+    clientX: touch.clientX,
+    clientY: touch.clientY,
+  }));
+
+  Object.defineProperties(event, {
+    touches: { value: activeTouches },
+    targetTouches: { value: activeTouches },
+    changedTouches: { value: changed },
+  });
+
+  target.dispatchEvent(event);
+  return event;
+}
+
 describe('Terminal Scrolling', () => {
   let terminal: Terminal;
   let container: HTMLElement;
@@ -331,6 +365,91 @@ describe('Terminal Scrolling', () => {
 
       closedTerminal.dispose();
     });
+  });
+});
+
+describe('Touch Scrolling', () => {
+  let terminal: Terminal;
+  let container: HTMLElement;
+
+  beforeEach(async () => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    terminal = await createIsolatedTerminal({
+      cols: 80,
+      rows: 24,
+      smoothScrollDuration: 0,
+    });
+    terminal.open(container);
+  });
+
+  afterEach(() => {
+    if (terminal) {
+      terminal.dispose();
+    }
+    if (container && document.body.contains(container)) {
+      document.body.removeChild(container);
+    }
+  });
+
+  test('single-finger drag scrolls scrollback in normal screen mode', async () => {
+    for (let i = 0; i < 50; i++) {
+      terminal.write(`Line ${i}\r\n`);
+    }
+
+    dispatchTouchEvent(container, 'touchstart', [{ identifier: 1, clientX: 20, clientY: 40 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 1, clientX: 20, clientY: 100 }]);
+    dispatchTouchEvent(
+      container,
+      'touchend',
+      [],
+      [{ identifier: 1, clientX: 20, clientY: 100 }]
+    );
+
+    expect(terminal.viewportY).toBeGreaterThan(0);
+  });
+
+  test('single-finger drag sends wheel mouse sequences in alternate screen mouse mode', async () => {
+    terminal.write('\x1B[?1049h\x1B[?1000h\x1B[?1006h');
+
+    const dataSent: string[] = [];
+    terminal.onData((data) => dataSent.push(data));
+
+    dispatchTouchEvent(container, 'touchstart', [{ identifier: 7, clientX: 10, clientY: 60 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 7, clientX: 10, clientY: 72 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 7, clientX: 10, clientY: 88 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 7, clientX: 10, clientY: 108 }]);
+    dispatchTouchEvent(
+      container,
+      'touchend',
+      [],
+      [{ identifier: 7, clientX: 10, clientY: 108 }]
+    );
+
+    expect(terminal.viewportY).toBe(0);
+    expect(dataSent.length).toBeGreaterThan(0);
+    expect(dataSent[0]).toContain('[<64;');
+  });
+
+  test('single-finger drag sends arrow keys in alternate screen without mouse tracking', async () => {
+    terminal.write('\x1B[?1049h');
+
+    const dataSent: string[] = [];
+    terminal.onData((data) => dataSent.push(data));
+
+    dispatchTouchEvent(container, 'touchstart', [{ identifier: 3, clientX: 15, clientY: 50 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 3, clientX: 15, clientY: 62 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 3, clientX: 15, clientY: 78 }]);
+    dispatchTouchEvent(container, 'touchmove', [{ identifier: 3, clientX: 15, clientY: 96 }]);
+    dispatchTouchEvent(
+      container,
+      'touchend',
+      [],
+      [{ identifier: 3, clientX: 15, clientY: 96 }]
+    );
+
+    expect(dataSent.length).toBeGreaterThan(0);
+    expect(dataSent.every((data) => data === '\x1B[A')).toBe(true);
   });
 });
 

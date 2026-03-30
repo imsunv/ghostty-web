@@ -172,6 +172,8 @@ export interface MouseTrackingConfig {
   getCanvasOffset: () => { left: number; top: number };
 }
 
+type MouseLikeEvent = Pick<MouseEvent, 'clientX' | 'clientY' | 'shiftKey' | 'metaKey' | 'ctrlKey'>;
+
 export class InputHandler {
   private encoder: KeyEncoder;
   private container: HTMLElement;
@@ -253,6 +255,29 @@ export class InputHandler {
    */
   setCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.customKeyEventHandler = handler;
+  }
+
+  /**
+   * Send a synthetic wheel event at a specific client position.
+   * Used by touch gesture handlers that need to emulate terminal wheel scrolling.
+   */
+  sendWheelAtPosition(deltaY: number, clientX: number, clientY: number): void {
+    if (this.isDisposed || deltaY === 0) return;
+    if (!this.mouseConfig?.hasMouseTracking()) return;
+
+    const cell = this.pointToCell(clientX, clientY);
+    if (!cell) return;
+
+    const button = deltaY < 0 ? 64 : 65;
+    const syntheticEvent = {
+      clientX,
+      clientY,
+      shiftKey: false,
+      metaKey: false,
+      ctrlKey: false,
+    } as MouseEvent;
+
+    this.sendMouseEvent(button, cell.col, cell.row, false, syntheticEvent);
   }
 
   /**
@@ -723,7 +748,7 @@ export class InputHandler {
   /**
    * Convert pixel coordinates to terminal cell coordinates
    */
-  private pixelToCell(event: MouseEvent): { col: number; row: number } | null {
+  private pointToCell(clientX: number, clientY: number): { col: number; row: number } | null {
     if (!this.mouseConfig) return null;
 
     const dims = this.mouseConfig.getCellDimensions();
@@ -731,8 +756,8 @@ export class InputHandler {
 
     if (dims.width <= 0 || dims.height <= 0) return null;
 
-    const x = event.clientX - offset.left;
-    const y = event.clientY - offset.top;
+    const x = clientX - offset.left;
+    const y = clientY - offset.top;
 
     // Convert to 1-based cell coordinates (terminal uses 1-based)
     const col = Math.floor(x / dims.width) + 1;
@@ -745,10 +770,14 @@ export class InputHandler {
     };
   }
 
+  private pixelToCell(event: MouseLikeEvent): { col: number; row: number } | null {
+    return this.pointToCell(event.clientX, event.clientY);
+  }
+
   /**
    * Get modifier flags for mouse event
    */
-  private getMouseModifiers(event: MouseEvent): number {
+  private getMouseModifiers(event: Pick<MouseEvent, 'shiftKey' | 'metaKey' | 'ctrlKey'>): number {
     let mods = 0;
     if (event.shiftKey) mods |= 4;
     if (event.metaKey) mods |= 8; // Meta (Cmd on Mac)
