@@ -467,7 +467,23 @@ export class Terminal implements ITerminalCore {
           // Forward key events
           this.keyEmitter.fire(keyEvent);
         },
-        this.customKeyEventHandler,
+        (event: KeyboardEvent) => {
+          // Built-in: Shift+PageUp/Down scrolls viewport when not in alternate screen
+          if (event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+            const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
+            if (!isAltScreen) {
+              if (event.code === 'PageUp') {
+                this.scrollPages(1);
+                return true;
+              }
+              if (event.code === 'PageDown') {
+                this.scrollPages(-1);
+                return true;
+              }
+            }
+          }
+          return this.customKeyEventHandler ? this.customKeyEventHandler(event) : false;
+        },
         (mode: number) => {
           // Query terminal mode state (e.g., mode 1 for application cursor mode)
           return this.wasmTerm?.getMode(mode, false) ?? false;
@@ -1545,19 +1561,30 @@ export class Terminal implements ITerminalCore {
   private handleWheel = (e: WheelEvent): void => {
     // Always prevent default browser scrolling
     e.preventDefault();
-    e.stopPropagation();
 
     // Allow custom handler to override
     if (this.customWheelEventHandler && this.customWheelEventHandler(e)) {
+      e.stopPropagation();
       return;
     }
 
-    // Check if in alternate screen mode (vim, less, htop, etc.)
+    // Check if in alternate screen mode (vim, less, htop, tmux, etc.)
     const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
+    const hasMouseTracking = this.wasmTerm?.hasMouseTracking() ?? false;
+
+    if (isAltScreen && hasMouseTracking) {
+      // Application has mouse tracking enabled (e.g. tmux with mouse mode on).
+      // Let input-handler forward the wheel event as mouse button 64/65 sequences
+      // so the application (tmux) can handle scroll internally.
+      // Do NOT call stopPropagation here — input-handler's wheel listener needs to fire.
+      return;
+    }
+
+    e.stopPropagation();
 
     if (isAltScreen) {
-      // Alternate screen: send arrow keys to the application
-      // Applications like vim handle scrolling internally
+      // Alternate screen without mouse tracking: send arrow keys to the application
+      // Applications like vim/htop handle scrolling internally via arrow keys
       // Standard: ~3 arrow presses per wheel "click"
       const direction = e.deltaY > 0 ? 'down' : 'up';
       const count = Math.min(Math.abs(Math.round(e.deltaY / 33)), 5); // Cap at 5
